@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""ACP wrapper for agy_acp_server.par that enables terminal-based OAuth login over Remote SSH."""
+
+from __future__ import annotations
+
+import base64
+import glob
+import hashlib
+import http.server
+import io
+import json
+import os
+import pathlib
+import re
+import secrets
+import select
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.parse
+import urllib.request
+import zipfile
+
+SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/aicode",
+]
+AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def find_agy_binary() -> str:
+    override = os.environ.get("AGY_ACP_BIN")
+    if override and os.path.exists(override):
+        return override
+    patterns = [
+        os.path.expanduser(
+            "~/Library/Application Support/Zed/external_agents/registry/antigravity-acp/*/agy_acp_server.par"
+        ),
+        os.path.expanduser(
+            "~/.local/share/zed/external_agents/registry/antigravity-acp/*/agy_acp_server.par"
+        ),
+    ]
+    matches: list[str] = []
+    for pattern in patterns:
+        matches.extend(glob.glob(pattern))
+    matches.sort(key=os.path.getmtime, reverse=True)
+    if matches:
+        return matches[0]
+    raise FileNotFoundError(
+        "Could not find agy_acp_server.par in Zed external_agents registry. "
+        "Set AGY_ACP_BIN or install antigravity-acp first."
+    )
+
+
+def load_oauth_client() -> tuple[str, str]:
+    env_id = os.environ.get("AGY_ACP_CLIENT_ID")
+    env_secret = os.environ.get("AGY_ACP_CLIENT_SECRET")
+    if env_id and env_secret:
+        return env_id, env_secret
+    data = pathlib.Path(find_agy_binary()).read_bytes()
+    idx = data.rfind(b"PK\x05\x06")
+    if idx == -1:
+        raise RuntimeError("Could not locate zip archive inside agy_acp_server.par")
+    clen = struct.unpack("<H", data[idx + 20 : idx + 22])[0]
+    with zipfile.ZipFile(io.BytesIO(data[: idx + 22 + clen])) as zf:
+        src = zf.read(
+            "google3/cloud/developer_experience/antigravity_extensions/acp_server/ccpa_connection/oauth_manager.py"
+        ).decode("utf-8")
+    cid = re.search(r'_DEFAULT_CLIENT_ID\s*=\s*\(?\s*"([^"]+)"', src)
+    csec = re.search(r'_DEFAULT_CLIENT_SECRET\s*=\s*\(?\s*"([^"]+)"', src)
+    if not cid or not csec:
+        raise RuntimeError("Could not extract OAuth client credentials from agy_acp_server.par")
+    return cid.group(1), csec.group(1)
+
+
+def token_file_path() -> pathlib.Path:
+    gemini_home = os.environ.get("GEMINI_HOME") or os.path.join(
+        os.path.expanduser("~"), ".gemini"
+    )
+    return pathlib.Path(os.path.expanduser(gemini_home)) / "antigravity-acp" / "acp_token.json"
+
+
+def save_token(token_data: dict, client_id: str, client_secret: str) -> pathlib.Path:
+    path = token_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": token_data["refresh_token"],
+        "token_uri": TOKEN_URI,
+        "scopes": SCOPES,
+    }
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    settings_path = path.parent / "settings.json"
+    settings_data = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    settings_data.setdefault("auth", {})["type"] = "oauth-personal"
+    settings_path.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def exchange_code(
+    code: str, redirect_uri: str, code_verifier: str, client_id: str, client_secret: str
+) -> dict:
+    body = urllib.parse.urlencode({
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+        "code_verifier": code_verifier,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URI,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def run_terminal_login() -> int:
+    client_id, client_secret = load_oauth_client()
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    state = secrets.token_urlsafe(24)
+    result: dict[str, str | None] = {"code": None, "error": None}
+    done = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            if params.get("state", [None])[0] != state:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Invalid OAuth state.")
+                return
+            if "error" in params:
+                result["error"] = params["error"][0]
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Authentication failed. You may close this tab.")
+                done.set()
+                return
+            if "code" in params:
+                result["code"] = params["code"][0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><body><h2>Antigravity ACP signed in.</h2>"
+                    b"<p>You can close this tab and return to Zed.</p></body></html>"
+                )
+                done.set()
+                return
+            self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), CallbackHandler)
+    port = server.server_address[1]
+    redirect_uri = f"http://127.0.0.1:{port}/"
+
+    auth_url = f"{AUTH_URI}?" + urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(SCOPES),
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+
+    print("=== Antigravity ACP Google Sign-In ===", flush=True)
+    print(f"\n1) Open this URL in your local browser:\n\n{auth_url}\n", flush=True)
+    print(
+        f"2) Either forward the callback port from your local machine:\n"
+        f"   ssh -N -L {port}:127.0.0.1:{port} <remote-host>\n"
+        f"   OR after signing in, paste the redirected URL (or the login code) here and press Enter:\n",
+        flush=True,
+    )
+
+    def serve_loop():
+        server.timeout = 0.5
+        while not done.is_set():
+            server.handle_request()
+
+    t = threading.Thread(target=serve_loop, daemon=True)
+    t.start()
+
+    try:
+        while not done.is_set():
+            if sys.stdin in select.select([sys.stdin], [], [], 0.5)[0]:
+                line = sys.stdin.readline().strip()
+                if not line:
+                    continue
+                parsed = urllib.parse.urlparse(line)
+                params = urllib.parse.parse_qs(parsed.query or (line if "code=" in line else ""))
+                if "code" in params:
+                    if params.get("state", [state])[0] != state:
+                        print("State mismatch in pasted URL; please try again.", flush=True)
+                        continue
+                    result["code"] = params["code"][0]
+                    done.set()
+                    break
+                elif " " not in line and not line.startswith("http"):
+                    result["code"] = urllib.parse.unquote(line)
+                    done.set()
+                    break
+                else:
+                    print("Could not find ?code=... in pasted input. Paste the redirect URL or login code.", flush=True)
+    finally:
+        done.set()
+        server.server_close()
+
+    if result["error"]:
+        print(f"Authentication error: {result['error']}", file=sys.stderr, flush=True)
+        return 1
+    if not result["code"]:
+        print("Authentication cancelled or timed out.", file=sys.stderr, flush=True)
+        return 1
+
+    token_data = exchange_code(result["code"], redirect_uri, code_verifier, client_id, client_secret)
+    if "refresh_token" not in token_data:
+        print("Error: Google did not return a refresh_token.", file=sys.stderr, flush=True)
+        return 1
+    saved = save_token(token_data, client_id, client_secret)
+    print(f"\nSuccess! Credentials saved to {saved}", flush=True)
+    print("You can now close this terminal and retry in Zed.", flush=True)
+    return 0
+
+
+def rewrite_initialize_response(line: str) -> str:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        return line
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return line
+    methods = result.get("authMethods")
+    if not isinstance(methods, list):
+        return line
+    changed = False
+    new_methods = []
+    for m in methods:
+        if isinstance(m, dict) and (m.get("id") == "oauth-personal" or m.get("methodId") == "oauth-personal"):
+            id_key = "methodId" if "methodId" in m else "id"
+            entry = {
+                "type": "terminal",
+                id_key: "oauth-personal",
+                "name": m.get("name", "Log in with Google"),
+                "description": "Opens a terminal with the Google OAuth URL (works over Remote SSH)",
+                "args": ["--login"],
+            }
+            if id_key == "methodId":
+                entry["env"] = []
+            new_methods.append(entry)
+            changed = True
+        else:
+            new_methods.append(m)
+    if changed:
+        result["authMethods"] = new_methods
+        return json.dumps(msg, separators=(",", ":")) + "\n"
+    return line
+
+
+def run_proxy(extra_args: list[str]) -> int:
+    binary = find_agy_binary()
+    env = os.environ.copy()
+    env["AGY_ACP_FORCE_FILE_STORAGE"] = "1"
+
+    proc = subprocess.Popen(
+        [binary, *extra_args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=sys.stderr,
+        env=env,
+        bufsize=0,
+    )
+
+    init_ids: set = set()
+    lock = threading.Lock()
+
+    def pump_stdin():
+        assert proc.stdin is not None
+        try:
+            for raw in sys.stdin.buffer:
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                    if msg.get("method") == "initialize" and "id" in msg:
+                        with lock:
+                            init_ids.add(msg["id"])
+                except Exception:
+                    pass
+                proc.stdin.write(raw)
+                proc.stdin.flush()
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=pump_stdin, daemon=True)
+    t.start()
+
+    assert proc.stdout is not None
+    try:
+        for raw in proc.stdout:
+            text = raw.decode("utf-8", errors="replace")
+            try:
+                msg = json.loads(text)
+                msg_id = msg.get("id")
+                with lock:
+                    is_init = msg_id in init_ids
+                    if is_init:
+                        init_ids.discard(msg_id)
+                if is_init:
+                    text = rewrite_initialize_response(text)
+                    raw = text.encode("utf-8")
+            except Exception:
+                pass
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+    except BrokenPipeError:
+        pass
+
+    return proc.wait()
+
+
+def main() -> int:
+    if "--login" in sys.argv[1:]:
+        return run_terminal_login()
+    return run_proxy(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
